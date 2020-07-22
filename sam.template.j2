@@ -1,0 +1,131 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+
+Description: |
+  A Serverless Application for use in CloudFormation as a Custom Resource
+  to convert an in-place deployment group to a blue/green group.
+
+Parameters:
+  CodeDeployApplication:
+    Description: The name of the CodeDeploy application that contains the deployment group that will be converted.
+    Type: String
+  CodeDeployDeploymentGroup:
+    Description: The name of the CodeDeploy deployment group that will be converted.
+    Type: String
+  AutoScalingGroup:
+    Description: The name of the AutoScaling Group that will be used for the Blue/Green deployment.
+    Type: String
+
+Metadata:
+  AWS::ServerlessRepo::Application:
+    Name: ConvertToBlueGreen
+    Description: A Serverless Application for use in CloudFormation as a Custom Resource to convert an in-place deployment group to a blue/green group.
+    Author: Andy Hopper
+    SpdxLicenseId: MIT
+    ReadmeUrl: README.md
+    Labels: [Git, CodeDeploy, CloudFormation]
+    SemanticVersion: 1.0.0
+    SourceCodeUrl: https://github.com/andyhopp/convert-to-bluegreen
+
+Resources:
+  UpdateDeploymentGroupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: ''
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns: [ 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole' ]
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      Policies:
+      - PolicyName: AllowUpdateCodeDeployGroup
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Action: [ 'codedeploy:UpdateDeploymentGroup' ]
+            Effect: Allow
+            Resource: !Sub arn:aws:codedeploy:${AWS::Region}:${AWS::AccountId}:deploymentgroup:${CodeDeployApplication}/${CodeDeployDeploymentGroup}
+
+  UpdateDeploymentGroup:
+    Type: AWS::Serverless::Function
+    Properties:
+      InlineCode:
+        !Sub |
+          import boto3
+          import cfnresponse
+          import logging
+          import traceback
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def handler(event, context):
+            responseData = {}
+            if event['RequestType'] == 'Delete':
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, 'CustomResourcePhysicalID')
+                          
+            if event['RequestType'] == 'Create':
+              try:
+                client = boto3.client('codedeploy')
+                targetGroup = client.get_deployment_group(applicationName = '${CodeDeployApplication}', deploymentGroupName = '${CodeDeployDeploymentGroup}')
+                
+                # Check to see if we're already blue/green
+                if 
+                  'deploymentGroupInfo' in targetGroup
+                  && 'deploymentStyle' in targetGroup['deploymentGroupInfo']
+                  && 'deploymentType' in targetGroup['deploymentGroupInfo']['deploymentStyle']
+                  && 'BLUE_GREEN' == targetGroup['deploymentGroupInfo']['deploymentStyle']['deploymentType']:
+                  logger.error('Deployment group already set to Blue/Green.')
+                  responseData = {'Error': 'Deployment group already set to Blue/Green.'}
+                  cfnresponse.send(event, context, cfnresponse.FAILED, responseData, 'CustomResourcePhysicalID')
+                  return
+
+                client.update_deployment_group(
+                  applicationName = '${CodeDeployApplication}',
+                  currentDeploymentGroupName = '${CodeDeployDeploymentGroup}',
+                  autoScalingGroups = ['${AutoScalingGroup}'],
+                  deploymentStyle = {
+                    'deploymentType': 'BLUE_GREEN',
+                    'deploymentOption': 'WITH_TRAFFIC_CONTROL'
+                  },
+                  blueGreenDeploymentConfiguration = {
+                    'terminateBlueInstancesOnDeploymentSuccess': {
+                      'action': 'KEEP_ALIVE'
+                    },
+                    'deploymentReadyOption': {
+                      'actionOnTimeout': 'CONTINUE_DEPLOYMENT'
+                    },
+                    'greenFleetProvisioningOption': {
+                      'action': 'COPY_AUTO_SCALING_GROUP'
+                    }
+                  }
+                )
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, 'CustomResourcePhysicalID')
+              except Exception as e:
+                logger.error(e, exc_info=True)
+                responseData = {'Error': traceback.format_exc(e) }
+                cfnresponse.send(event, context, cfnresponse.FAILED, responseData, 'CustomResourcePhysicalID')
+      Description: Lambda to update the configuration of a CodeDeploy deployment group
+      Handler: index.handler
+      MemorySize: 128
+      Role: !GetAtt UpdateDeploymentGroupRole.Arn
+      Runtime: python3.7
+      Timeout: 30
+
+Outputs:
+  FunctionName:
+    Description: The name of the deployed function.
+    Value: !Ref UpdateDeploymentGroup
+  FunctionArn:
+    Description: The ARN of the deployed function.
+    Value: !GetAtt UpdateDeploymentGroup.Arn
